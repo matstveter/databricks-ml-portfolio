@@ -246,6 +246,8 @@ display(my_prediction.select("carat", "cut", "color", "clarity", "prediction"))
 # MAGIC
 # MAGIC While GBT offered a lower MAE, it did not significantly improve the $R^2$ or RMSE. The model appears to be more sensitive to outliers, punishing the RMSE score despite better average performance.
 # MAGIC
+# MAGIC Another natural next steps would be NN, but the lack of compute makes it difficult, so we stop with the exploration here. 
+# MAGIC
 # MAGIC Since algorithm tuning has hit a plateau (~0.97 $R^2$), we will see if we can do some more Feature Engineering.
 # MAGIC
 # MAGIC Diamond prices follow an exponential curve, but regression models prefer normal distributions.
