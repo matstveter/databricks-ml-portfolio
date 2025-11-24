@@ -168,14 +168,15 @@ display(analysis_df.select("price", "prediction", "error", "carat", "cut").order
 
 # MAGIC %md
 # MAGIC ### Evaluation: Linear Regression: Baseline
-# MAGIC * R² Score: 0.90 (Strong correlation)
-# MAGIC * RMSE: $1,246 (High average error)
-# MAGIC * MAE: $859.70
+# MAGIC --- Evaluation: LinearRegression ---
+# MAGIC * R² Score:  0.9001
+# MAGIC * RMSE:      $1,246.08
+# MAGIC * MAE:       $859.70
 # MAGIC
-# MAGIC **Analysis:**
+# MAGIC Analysis:
 # MAGIC While the linear model captures the general trend, the high RMSE suggests that the relationship between diamond features and price is non-linear. Diamond prices tend to jump exponentially (e.g., a 2.0-carat diamond is much more than 2x the price of a 1.0-carat diamond).
 # MAGIC
-# MAGIC **Next Step:**
+# MAGIC Next Step:
 # MAGIC Train a Random Forest Regressor. Tree-based models are better suited to capture non-linear patterns and threshold-based pricing jumps without requiring complex feature transformation.
 # MAGIC
 
@@ -201,14 +202,15 @@ display(my_prediction.select("carat", "cut", "color", "clarity", "prediction"))
 
 # MAGIC %md
 # MAGIC ### Evaluation: Random Forest Regressor (Tuned)
-# MAGIC * R² Score: 0.9678 (Excellent fit)
-# MAGIC * RMSE: $707.13 (Significant reduction from baseline)
-# MAGIC * MAE: $367.18 (Precision improved by ~58%)
+# MAGIC --- Evaluation: RandomForestRegressor ---
+# MAGIC * R² Score:  0.9678
+# MAGIC * RMSE:      $707.13
+# MAGIC * MAE:       $367.18
 # MAGIC
-# MAGIC **Analysis:**
+# MAGIC Analysis:
 # MAGIC The Random Forest model dramatically outperformed the linear baseline by capturing the non-linear thresholds in the data (e.g., specific quality combinations). The average error dropped from ~$860 to ~$367. 
 # MAGIC
-# MAGIC However, we discovered a **critical limitation**: The model failed to extrapolate the price of a theoretical "Perfect Diamond" (predicting $16,756 instead of $50,000+). This confirms that tree-based models are bounded by the maximum value in their training set (~$18,823) and cannot predict outside that range.
+# MAGIC However, the model failed to extrapolate the price of a theoretical "Perfect Diamond" (predicting $16,756 instead of $50,000+). This confirms that tree-based models are bounded by the maximum value in their training set (~$18,823) and cannot predict outside that range.
 # MAGIC
 # MAGIC Next Step:
 # MAGIC To squeeze the final percentage points of performance, we could try Gradient Boosted Trees (GBT), which correct errors sequentially, suggested in Kaggle competetions
@@ -232,7 +234,22 @@ display(my_prediction.select("carat", "cut", "color", "clarity", "prediction"))
 
 # COMMAND ----------
 
-#
+# MAGIC %md
+# MAGIC # Analysis Gradient Boosted Trees
+# MAGIC We see that the performance is not particularly better than the RF
+# MAGIC
+# MAGIC Training Gradient Boosted Trees...
+# MAGIC --- Evaluation: GBT Regressor ---
+# MAGIC * R² Score:  0.9676
+# MAGIC * RMSE:      $710.01
+# MAGIC * MAE:       $332.86
+# MAGIC
+# MAGIC While GBT offered a lower MAE, it did not significantly improve the $R^2$ or RMSE. The model appears to be more sensitive to outliers, punishing the RMSE score despite better average performance.
+# MAGIC
+# MAGIC Since algorithm tuning has hit a plateau (~0.97 $R^2$), we will see if we can do some more Feature Engineering.
+# MAGIC
+# MAGIC Diamond prices follow an exponential curve, but regression models prefer normal distributions.
+# MAGIC By training the model on the Logarithm of the Price ($\log(price)$), we can compress the massive price range into a linear scale, potentially helping the Random Forest capture the trend more accurately.
 
 # COMMAND ----------
 
@@ -258,4 +275,37 @@ evaluate_model(predictions_for_eval, model_name="Log-Transformed Random Forest")
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC # Analysis Log-Transformation Experiment
+# MAGIC
+# MAGIC --- Evaluation: Log-Transformed Random Forest ---
+# MAGIC * R² Score:  0.9584
+# MAGIC * RMSE:      $807.36
+# MAGIC * MAE:       $387.05
 
+# COMMAND ----------
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+rf_stage = model_rf.stages[-1] # The last stage is the model
+assembler_stage = model_rf.stages[1] # The 2nd stage is the VectorAssembler
+
+# 2. Map Numbers back to Names
+# The model only knows "Feature 0", "Feature 1". We need names.
+feature_names = assembler_stage.getInputCols()
+importances = rf_stage.featureImportances.toArray()
+
+# 3. Create a Pandas DataFrame for Plotting
+fi_df = pd.DataFrame({
+    'Feature': feature_names,
+    'Importance': importances
+}).sort_values(by='Importance', ascending=False)
+
+# 4. Plot
+plt.figure(figsize=(10, 6))
+sns.barplot(x='Importance', y='Feature', data=fi_df, palette="viridis")
+plt.title('What Drives Diamond Prices? (Model Interpretation)')
+plt.xlabel('Relative Importance (0.0 - 1.0)')
+plt.show()
