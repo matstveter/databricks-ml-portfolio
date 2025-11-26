@@ -2,8 +2,10 @@
 from pyspark.sql.functions import col, trim, when, lit, coalesce, row_number, count
 from pyspark.sql.window import Window
 from pyspark.sql.types import StringType
-from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, Imputer
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, Imputer, StandardScaler, MinMaxScaler
 from pyspark.ml import Pipeline
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator, BinaryClassificationEvaluator
 
 # COMMAND ----------
 
@@ -16,9 +18,6 @@ df_raw = spark.read.format("csv").option("inferSchema", "true").load(dataset_pat
 # COMMAND ----------
 
 display(df_raw)
-
-# COMMAND ----------
-
 display(df_raw.summary())
 
 # COMMAND ----------
@@ -68,6 +67,9 @@ display(df_clean.select("education", "education_num").distinct().orderBy("educat
 
 # Here we see that the education_num is just a numerical value of education, so we remove the categorical columns education
 df_clean = df_clean.drop("education")
+
+# Due to size limitations, we remove this....
+df_clean = df_clean.drop("native_country")
 
 # COMMAND ----------
 
@@ -198,9 +200,6 @@ def predictive_grouping(df):
     for c_col in ["workclass", "occupation"]:
         if df.filter(col(c_col).isNull()).count() > 0:
             df = impute_grouped_mode(df, target_col=c_col, group_cols=job_group_keys)
-
-    if df.filter(col("native_country").isNull()).count() > 0:
-            df = impute_grouped_mode(df, target_col="native_country", group_cols=["race"])
         
     cat_cols = [f.name for f in df.schema.fields if isinstance(f.dataType, StringType)]
     df = df.na.fill({c: "Unknown" for c in cat_cols})
@@ -214,18 +213,145 @@ def predictive_grouping(df):
 
 # COMMAND ----------
 
-train_raw, test_df = df_clean.randomSplit([0.6, 0.4], seed=42)
+def build_pipeline(df):
+    # There are some categorical columns that needs to be handled:
+    cat_columns = ['workclass', 'marital_status', 'occupation', 'relationship', 'race', 'sex']
+    num_cols = ["age", "fnlwgt", "education_num", "capital_gain", "capital_loss", "hours_per_week"]
 
-check_for_missing(test_raw)
-test_clean = drop_missing(test_raw)
+    # None of these have relations that makes one better than the other, so we do not need ordinal encoding here
+    stages = []
+
+    for c in cat_columns:
+        indexer = StringIndexer(inputCol=c, outputCol=c+"_index", handleInvalid="skip")
+        encoder = OneHotEncoder(inputCol=c+"_index", outputCol=c+"_vec")
+
+        stages += [indexer, encoder]
+
+    num_assembler = VectorAssembler(inputCols=num_cols, outputCol="num_features_raw")
+    stages.append(num_assembler)
+
+    scaler = StandardScaler(inputCol="num_features_raw", outputCol="num_features_scaled", 
+                                withStd=True, withMean=True)
+    stages.append(scaler)
+
+    final_inputs = [c + "_vec" for c in cat_columns] + ["num_features_scaled"]
+    final_assembler = VectorAssembler(inputCols=final_inputs, outputCol="features")
+    stages.append(final_assembler)
+
+    return Pipeline(stages=stages)
+
+def get_top_categories(df, col_name, top_k=5):
+    """
+    Scans the dataframe and returns a Python list of the Top K values.
+    """
+    # Group, Count, Sort Descending, Take Top K
+    top_rows = df.groupBy(col_name).count().orderBy(col("count").desc()).limit(top_k).collect()
+    
+    # Extract just the strings
+    top_values = [row[0] for row in top_rows]
+    
+    print(f"Learned Top {top_k} categories for '{col_name}': {top_values}")
+    return top_values
+
+def apply_cardinality_mask(df, col_name, allowed_values):
+    """
+    Forces the column to only contain values in 'allowed_values'.
+    Everything else becomes 'Other'.
+    """
+    # Logic: If value is in the allowed list, keep it. Else -> "Other"
+    return df.withColumn(col_name, 
+        when(col(col_name).isin(allowed_values), col(col_name))
+        .otherwise(lit("Other"))
+    )
+
+# COMMAND ----------
+
+def evaluate_classifier(predictions, label_col="label", prediction_col="prediction"):
+    """
+    Prints a comprehensive classification report for PySpark models.
+    """
+
+    mc_evaluator = MulticlassClassificationEvaluator(labelCol=label_col, predictionCol=prediction_col)
+    bc_evaluator = BinaryClassificationEvaluator(labelCol=label_col, rawPredictionCol="rawPrediction")
+    
+    # 2. Calculate Metrics
+    accuracy = mc_evaluator.evaluate(predictions, {mc_evaluator.metricName: "accuracy"})
+    precision = mc_evaluator.evaluate(predictions, {mc_evaluator.metricName: "weightedPrecision"})
+    recall = mc_evaluator.evaluate(predictions, {mc_evaluator.metricName: "weightedRecall"})
+    f1 = mc_evaluator.evaluate(predictions, {mc_evaluator.metricName: "f1"})
+    auc = bc_evaluator.evaluate(predictions, {bc_evaluator.metricName: "areaUnderROC"})
+
+    class_counts = predictions.groupBy(label_col).count().orderBy(label_col).collect()
+    total_rows = predictions.count()
+    
+    print("--- Classification Report ---")
+    print(f"Total Rows: {total_rows}")
+    for row in class_counts:
+        label = row[label_col]
+        count = row['count']
+        pct = (count / total_rows) * 100
+        print(f"  - Class {label} count: {count} ({pct:.1f}%)")
+    
+    # 3. Print Report
+    print("-" * 30)
+    print(f"Accuracy:  {accuracy:.2%}")
+    print(f"Precision: {precision:.2%}")
+    print(f"Recall:    {recall:.2%}")
+    print(f"F1 Score:  {f1:.2%}")
+    print(f"AUC (ROC): {auc:.4f}")
+    print("-" * 30)
+
+    cm = predictions.groupBy("label", "prediction").count().orderBy("label", "prediction")
+
+    print("--- Confusion Matrix ---")
+    print("Label = Truth, Prediction = Model Guess")
+    cm.show()
+    
+    return {"accuracy": accuracy, "f1": f1, "auc": auc}
+
+# COMMAND ----------
+
+def test_impute_strat(train, val):
+
+    prep_pipeline_standard = build_pipeline(df=train)
+    prep_model_stanard = prep_pipeline_standard.fit(train)
+
+    train = prep_model_stanard.transform(train)
+    val = prep_model_stanard.transform(val)
+
+    lr = LogisticRegression(featuresCol="features", labelCol="label", maxIter=10)
+    lr_model = lr.fit(train)
+    predictions = lr_model.transform(val)
+
+    metrics = evaluate_classifier(predictions)
+
+    del lr_model, prep_model_stanard, prep_pipeline_standard, lr, predictions, train, val
+
+# COMMAND ----------
+
+train_raw, temp_df = df_clean.randomSplit([0.6, 0.4], seed=42)
+val_raw, test_raw = temp_df.randomSplit([0.5, 0.5], seed=42)
+
+#check_for_missing(test_raw)
+#test_clean = drop_missing(test_raw)
 
 # We investigate 3 strategies for handling missing data
 train_raw = update_missing(train_raw)
 val_raw = update_missing(val_raw)
 
+# COMMAND ----------
+
 # 1. Just removing the missing data
 train_no_impute = drop_missing(train_raw)
 val_no_impute = drop_missing(val_raw)
+
+test_impute_strat(train=train_no_impute, val=val_no_impute)
+
+del train_no_impute, val_no_impute
+
+# COMMAND ----------
+
+
 
 # COMMAND ----------
 
@@ -233,36 +359,14 @@ val_no_impute = drop_missing(val_raw)
 train_impute_mean = impute_mean(train_raw)
 val_impute_mean = impute_mean(val_raw)
 
+test_impute_strat(train=train_impute_mean, val=val_impute_mean)
+
+del train_impute_mean, val_impute_mean
+
+# COMMAND ----------
+
 # 3. A "smarter" predictive grouping based on other columns
 train_p_impute = predictive_grouping(train_raw)
 val_p_impute = predictive_grouping(val_raw)
 
-
-# COMMAND ----------
-
-def build_pipeline():
-    # There are some categorical columns that needs to be handled:
-    cat_columns = ['workclass', 'marital_status', 'occupation', 'relationship', 'race', 'sex', 'native_country']
-
-    # None of these have relations that makes one better than the other, so we do not need ordinal encoding here
-    stages = []
-
-    for c in cat_columns:
-        indexer = StringIndexer(inputCol=c, outputCol=c+"_index", handleInvalid="keep")
-        encoder = OneHotEncoder(inputCol=c+"_index", outputCol=c+"_vec")
-
-        stages += [indexer, encoder]
-
-    num_cols = ["age", "fnlwgt", "education_num", "capital_gain", "capital_loss", "hours_per_week"]
-
-    assembler_inputs = [c + "_vec" for c in cat_columns] + num_cols
-    assembler = VectorAssembler(inputCols=assembler_inputs, outputCol="features")
-
-    stages.append(assembler)
-
-    return stages
-
-# COMMAND ----------
-
-
-
+test_impute_strat(train=train_p_impute, val=val_p_impute)
