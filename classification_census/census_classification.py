@@ -4,7 +4,7 @@ from pyspark.sql.window import Window
 from pyspark.sql.types import StringType
 from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, Imputer, StandardScaler, MinMaxScaler
 from pyspark.ml import Pipeline
-from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.classification import LogisticRegression, RandomForestClassifier, GBTClassifier, LinearSVC, FMClassifier
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator, BinaryClassificationEvaluator
 
 # COMMAND ----------
@@ -342,31 +342,126 @@ val_raw = update_missing(val_raw)
 # COMMAND ----------
 
 # 1. Just removing the missing data
-train_no_impute = drop_missing(train_raw)
-val_no_impute = drop_missing(val_raw)
-
-test_impute_strat(train=train_no_impute, val=val_no_impute)
-
-del train_no_impute, val_no_impute
+train = drop_missing(train_raw)
+val = drop_missing(val_raw)
 
 # COMMAND ----------
 
-
-
-# COMMAND ----------
+#####
+# We dont have the compute to run other strategies for now
+#####
 
 # 2. Impute with mean for numerical and the most common value for categorical
-train_impute_mean = impute_mean(train_raw)
-val_impute_mean = impute_mean(val_raw)
+#train_impute_mean = impute_mean(train_raw)
+#val_impute_mean = impute_mean(val_raw)
 
-test_impute_strat(train=train_impute_mean, val=val_impute_mean)
+#test_impute_strat(train=train_impute_mean, val=val_impute_mean)
 
-del train_impute_mean, val_impute_mean
+#del train_impute_mean, val_impute_mean
+
+# 3. A "smarter" predictive grouping based on other columns
+#train_p_impute = predictive_grouping(train_raw)
+#val_p_impute = predictive_grouping(val_raw)
+
+#test_impute_strat(train=train_p_impute, val=val_p_impute)
 
 # COMMAND ----------
 
-# 3. A "smarter" predictive grouping based on other columns
-train_p_impute = predictive_grouping(train_raw)
-val_p_impute = predictive_grouping(val_raw)
+prep_pipeline_standard = build_pipeline(df=train)
+prep_model_stanard = prep_pipeline_standard.fit(train)
 
-test_impute_strat(train=train_p_impute, val=val_p_impute)
+train = prep_model_stanard.transform(train)
+val = prep_model_stanard.transform(val)
+
+lr = LogisticRegression(featuresCol="features", labelCol="label", maxIter=10)
+lr_model = lr.fit(train)
+predictions = lr_model.transform(val)
+evaluate_classifier(predictions)
+
+# COMMAND ----------
+
+rf = RandomForestClassifier(
+    featuresCol="features", 
+    labelCol="label", 
+    numTrees=100, 
+    maxDepth=12, 
+    maxBins=100,
+    seed=42)
+rf_model = rf.fit(train)
+predictions = rf_model.transform(val)
+evaluate_classifier(predictions)
+
+# COMMAND ----------
+
+gbt = GBTClassifier(
+    featuresCol="features", 
+    labelCol="label", 
+    maxIter=20, 
+    maxDepth=5,
+    seed=42
+)
+gbt_model = gbt.fit(train)
+predictions = gbt_model.transform(val)
+evaluate_classifier(predictions)
+
+# COMMAND ----------
+
+svm = LinearSVC(featuresCol="features", labelCol="label", maxIter=10)
+model_svm = svm.fit(train)
+predictions_svm = model_svm.transform(val)
+metrics_svm = evaluate_classifier(predictions_svm)
+
+# COMMAND ----------
+
+fm = FMClassifier(featuresCol="features", labelCol="label", stepSize=0.001)
+model_fm = fm.fit(train)
+predictions_fm = model_fm.transform(val)
+metrics_fm = evaluate_classifier(predictions_fm)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Testing the best model RF on the test set
+
+# COMMAND ----------
+
+test = prep_model_stanard.transform(test_raw)
+predictions_test = rf_model.transform(test)
+metrics_final = evaluate_classifier(predictions_test)
+
+# COMMAND ----------
+
+# Feature importance
+importances = rf_model.featureImportances.toArray()
+print(importances)
+
+# COMMAND ----------
+
+def plot_rf_importance(model, df):
+    # Extract Feature Names from Metadata
+    attrs = sorted(
+        [x for t in ["binary", "numeric"] for x in df.schema["features"].metadata["ml_attr"]["attrs"].get(t, [])], 
+        key=lambda x: x["idx"]
+    )
+    
+    # Maps "marital_status_vec_Married" -> "marital_status" and "num_features_scaled_0" -> "age" (via lookup)
+    num_map = {f"num_features_scaled_{i}": c for i, c in enumerate(["age", "fnlwgt", "education_num", "capital_gain", "capital_loss", "hours_per_week"])}
+    
+    # Create DataFrame & Aggregate
+    df_imp = pd.DataFrame({"name": [a["name"] for a in attrs], "imp": model.featureImportances.toArray()})
+    df_imp["base"] = df_imp["name"].apply(lambda n: num_map.get(n, n.split("_vec_")[0].replace("_idx", "")))
+    
+    agg = df_imp.groupby("base")["imp"].sum().sort_values(ascending=False).reset_index()
+    
+    plt.figure(figsize=(10, 5))
+    sns.barplot(x='imp', y='base', data=agg, palette="viridis", hue="base")
+    plt.title('Feature Importance')
+    plt.show()
+    return agg
+
+# Run
+final_df = plot_rf_importance(rf_model, test)
+
+# COMMAND ----------
+
+
